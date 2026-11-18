@@ -23,4 +23,11 @@
     <ProjectReference Include="..\..\src\TradeProcessor.Infrastructure\TradeProcessor.Infrastructure.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The same schema the Docker Compose Postgres uses -->
+    <None Include="..\..\db\init.sql" Link="init.sql" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Shared with the unit tests, so there is one copy -->
+    <Compile Include="..\TradeProcessor.UnitTests\TestData\TradeBuilder.cs" Link="TestData\TradeBuilder.cs" />
+  </ItemGroup>
+
 </Project>
