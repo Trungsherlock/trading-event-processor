@@ -84,16 +84,17 @@ public sealed class NpgsqlTradeRepositoryTests(PostgresFixture pg) : IAsyncLifet
     }
 
     [Fact]
-    public async Task Failed_position_update_rolls_back_the_trade_insert()
+    public async Task Failed_position_update_rolls_back_the_trade_insert_and_is_reported_as_permanent()
     {
         // Each trade fits its column, but the sum overflows positions.net_quantity (NUMERIC(18,4)).
         var big = TradeBuilder.Valid() with { Quantity = 99_999_999_999_999m };
         await _repo.SaveAsync(big, default);
 
         var second = big with { TradeId = Guid.NewGuid() };
-        var ex = await Assert.ThrowsAsync<PostgresException>(() => _repo.SaveAsync(second, default));
+        var ex = await Assert.ThrowsAsync<TradeRejectedException>(() => _repo.SaveAsync(second, default));
 
-        Assert.Equal(PostgresErrorCodes.NumericValueOutOfRange, ex.SqlState);
+        // A permanent data error, so the handler sends it to the DLQ instead of retrying forever
+        Assert.Equal(PostgresErrorCodes.NumericValueOutOfRange, Assert.IsType<PostgresException>(ex.InnerException).SqlState);
         Assert.Equal(1, await TradeCountAsync());            // the second insert was rolled back
         Assert.Equal(99_999_999_999_999m, await PositionAsync("ACC-1001", "AAPL"));
     }

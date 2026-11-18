@@ -10,7 +10,28 @@ namespace TradeProcessor.Infrastructure;
 /// </summary>
 public sealed class NpgsqlTradeRepository(NpgsqlDataSource db) : ITradeRepository
 {
-    public async Task<StoreResult> SaveAsync(Trade t, CancellationToken ct)
+    public async Task<StoreResult> SaveAsync(Trade trade, CancellationToken ct)
+    {
+        try
+        {
+            return await SaveInTransactionAsync(trade, ct);
+        }
+        catch (PostgresException ex) when (IsPermanentDataError(ex))
+        {
+            // The transaction has already rolled back. Retrying would fail the same way every time.
+            throw new TradeRejectedException($"{ex.SqlState}: {ex.MessageText}", ex);
+        }
+    }
+
+    /// <summary>
+    /// Class 22 (data exception, e.g. numeric overflow) and class 23 (constraint violation) depend
+    /// only on the data. Connection errors, timeouts, deadlocks and the like are worth retrying.
+    /// </summary>
+    private static bool IsPermanentDataError(PostgresException ex) =>
+        ex.SqlState.StartsWith("22", StringComparison.Ordinal) ||
+        ex.SqlState.StartsWith("23", StringComparison.Ordinal);
+
+    private async Task<StoreResult> SaveInTransactionAsync(Trade t, CancellationToken ct)
     {
         await using var conn = await db.OpenConnectionAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);

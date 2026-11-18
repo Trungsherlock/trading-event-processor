@@ -11,8 +11,8 @@ Design decisions, tradeoffs, metrics and workflow for the trade event processor.
 | 2. Docker Compose + schema | Done (2026-11-17) |
 | 3. Domain + validation (TDD) | Done (2026-11-17) |
 | 4. Repository + integration tests | Done (2026-11-17) |
-| 5. Handler + Kafka consumer | Next |
-| 6. Producer, crash test, throughput | Not started |
+| 5. Handler + Kafka consumer | Done (2026-11-18) |
+| 6. Producer, crash test, throughput | Next |
 | 7. CI | Not started |
 | 8. UML + README | Not started |
 
@@ -26,6 +26,8 @@ Design decisions, tradeoffs, metrics and workflow for the trade event processor.
 | Partition key = `accountId`, 3 partitions | Keeps each account's trades in order. | Ordering only holds within an account. Parallelism is capped at 3 consumers, and one busy account can overload its partition. |
 | Topics created by a one-shot `kafka-init` container. Broker auto-create is turned off. | `docker compose up -d` gives a ready environment in one step. With auto-create on, the first producer or a typo in a topic name would create a 1-partition topic, which quietly removes per-account parallelism. | The broker needs explicit listener config (one for other containers, one for the host) instead of the image defaults. Changing the partition count means editing the compose file and recreating the topic. |
 | Integration tests share one Postgres container and empty the tables before each test | The container starts once per run instead of once per test. Every test still starts from an empty database. | Tests in the shared group run one at a time, not in parallel. |
+| The handler splits failures into permanent and temporary | Permanent failures (malformed, invalid, rejected by the database) go to the DLQ and the offset is committed. Temporary ones (database or Kafka unreachable) propagate, and the offset isn't committed. | Every new failure type has to be classified, and a wrong guess either loops forever or loses a retry. |
+| Retry the whole handler call in the worker: 3 retries with exponential backoff, then stop with exit code 1 | One retry point covers both database and DLQ outages. Stopping keeps the message uncommitted, so it's redelivered after a restart. | Something has to restart the worker. A retried DLQ publish can produce a duplicate DLQ entry. |
 | Dead-letter queue (DLQ) for malformed or invalid messages | One bad message (a "poison pill") would otherwise block its partition forever. | Someone has to monitor the DLQ and replay or discard what lands there. |
 | Plain ADO.NET, no ORM | Full control over the SQL (`ON CONFLICT`, the transaction boundary). No ORM overhead. | More boilerplate. Mapping is done by hand. |
 | Core project has no Kafka or Postgres dependencies | Most tests run in milliseconds without Docker, which makes test-first practical. | Needs extra interfaces (`ITradeRepository`, `IDeadLetterPublisher`) and fakes. |
@@ -38,13 +40,13 @@ Design decisions, tradeoffs, metrics and workflow for the trade event processor.
 
 Found while reviewing the plan. Each one needs resolving in the phase listed.
 
-1. **Poison pills that get past the DLQ (Phases 3–5).**
+1. ~~**Poison pills that get past the DLQ (Phases 3–5).**~~ Fixed: database values in Phase 3, parsing in Phase 5.
    - **Parsing:** a parse failure that isn't a `JsonException` or `FormatException` isn't caught, so the worker crashes and the message is redelivered forever. Examples: a `null` message body, an empty (tombstone) message, an unknown `side` value.
    - **Database:** a value too large for `NUMERIC(18,4)` passes validation but fails in Postgres. All DB errors are treated as temporary, so this also loops.
    - **Fix:** have `TradeMessage.Parse` turn every failure into one exception type (Phase 5, still open). The database part is fixed: the two precision rules added in Phase 3 reject these values before the insert.
-2. **The retry policy isn't in the code (Phase 5).** The failure table says "retry 3× with backoff, then crash", but nothing retries yet. The crash part already works, because an unhandled exception in a background service stops the host.
+2. ~~**The retry policy isn't in the code (Phase 5).**~~ Fixed in Phase 5. The failure table says "retry 3× with backoff, then crash", but nothing retries yet. The crash part already works, because an unhandled exception in a background service stops the host.
 3. ~~**Each integration test starts its own Postgres container (Phase 4).**~~ Fixed in Phase 4: one container is shared, and the tables are emptied before each test.
-4. **A position can overflow even when each trade is valid (Phase 5).** Two trades of 99,999,999,999,999 each fit `trades.quantity`, but their sum doesn't fit `positions.net_quantity`. The transaction rolls back, which is correct, but the error is permanent, so the message would be redelivered forever. Fix: in the handler, treat Postgres data errors (codes starting with 22 or 23) as permanent and send the message to the DLQ. Keep retrying connection and timeout errors.
+4. ~~**A position can overflow even when each trade is valid (Phase 5).**~~ Fixed in Phase 5. Two trades of 99,999,999,999,999 each fit `trades.quantity`, but their sum doesn't fit `positions.net_quantity`. The transaction rolls back, which is correct, but the error is permanent, so the message would be redelivered forever. Fix: in the handler, treat Postgres data errors (codes starting with 22 or 23) as permanent and send the message to the DLQ. Keep retrying connection and timeout errors.
 
 ## Metrics
 
@@ -52,7 +54,7 @@ Fill these in only with measured values.
 
 | Metric | Value | How it's measured | Date |
 |---|---|---|---|
-| Unit tests | 40 (local run; CI not set up yet) | `dotnet test` count | 2026-11-17 |
+| Unit tests | 74 (local run; CI not set up yet) | `dotnet test` count | 2026-11-18 |
 | Integration tests | 6 (local run; CI not set up yet) | `dotnet test` count | 2026-11-17 |
 | Throughput, commit per message | — msg/s | 100k messages, local machine | |
 | Throughput, background offset commit | — msg/s | 100k messages, local machine | |
@@ -185,3 +187,74 @@ Chose C: it's the fastest option that still gives every test a clean database, a
 | **C. Compile the unit tests' file into the integration tests too** ✅ | One copy, no new project | Its namespace says `UnitTests` |
 
 Chose C for now. Switch to B if more helpers need sharing.
+
+### 2026-11-18: Phase 5 (handler + Kafka consumer)
+
+- **Message flow:** parse, validate, store. Each message ends up stored, a duplicate, or in the DLQ, and only then is its offset committed. Anything else stops the worker without committing.
+- **Parsing:** every way a message can be broken produces one exception type, which goes to the DLQ. That includes empty messages, JSON `null`, wrong types, unknown sides and missing fields (all listed by name). This closes open issue #1.
+- **Permanent database errors:** the repository translates Postgres data errors (codes 22/23) into a "rejected" error that goes to the DLQ. This closes open issue #4.
+- **Retry:** 3 retries at 200, 400 and 800 ms, then the worker stops with exit code 1. This closes open issue #2.
+- **DLQ entries:** the original message, every error, and the time it failed. The worker waits for the broker to confirm the DLQ entry is stored before committing the source offset.
+- **End-to-end check** against the Docker Compose stack, with 12 messages in total. Every outcome matched:
+  - Valid trades were stored, and buys and sells netted correctly (ACC-1 / AAPL: 100 − 30 + 5 + 10 = 85).
+  - A resent trade was logged as a duplicate and the position didn't change.
+  - The invalid trade went to the DLQ with both its errors listed.
+  - Broken JSON went to the DLQ.
+  - The message with missing fields went to the DLQ with all 6 field names listed.
+  - The overflowing position went to the DLQ as "Rejected by database: 22003".
+  - **Stopping Postgres:** 3 retries, then the worker stopped without committing. After Postgres and the worker restarted, the same trade was redelivered and stored.
+  - A worker restart after a forced stop resumed at the next uncommitted offset.
+- **Found during the check:** Windows PowerShell adds a UTF-8 byte order mark (BOM) when piping text to a program. The first test message was rejected as invalid JSON because of it. The parser now ignores one leading BOM, as RFC 8259 allows (see the options below).
+- Gate passed: valid trades appear in Postgres and bad ones in `trades.dlq`. 80 tests pass and the build has 0 warnings.
+
+#### Options considered
+
+**Turning the JSON message into a `Trade`**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. Read the JSON straight into `Trade` | Least code | Fails in several different ways, and a missing field quietly becomes a default value (for example, a missing `executedAt` becomes year 0001 and passes the future check) |
+| **B. Read into an intermediate type where every field is optional, then convert; one exception type for every failure** ✅ | Missing fields are reported by name, and the handler catches exactly one exception | A second type that mirrors `Trade` |
+| C. A `TryParse` that returns a result instead of throwing | No exceptions for expected failures | More code for little gain at this message volume |
+
+**Where permanent database errors are recognized**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. The handler inspects Postgres error codes | One place | Core would depend on Postgres |
+| **B. The repository translates codes 22/23 into a Core "rejected" error** ✅ | Core stays independent of the database, and the rule is covered by a test against real Postgres | The repository needs to know which errors are permanent |
+| C. Treat every database error as temporary | Simplest | A permanent error, like the overflow in open issue #4, is retried forever |
+
+**Where the retry lives**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. Polly / Microsoft.Extensions.Resilience | Battle-tested, with jitter and circuit breakers | A dependency for one 3-retry loop |
+| B. Retry inside the repository | Close to the database call | Doesn't cover DLQ publish failures |
+| **C. A small retry helper in Core, called by the worker around the whole handler call** ✅ | One place covers database and Kafka outages, it's unit-tested without waiting, and it adds no package | No jitter. A retried DLQ publish can produce a duplicate DLQ entry. |
+| D. No retry: stop on the first error | Simplest | A brief network blip stops the worker |
+
+**After the last retry fails**
+
+| Option | Upside | Downside |
+|---|---|---|
+| **A. Stop with exit code 1, offset not committed** ✅ | Nothing is lost, the failure is obvious, and a supervisor can restart it | Something has to restart the worker |
+| B. Keep retrying forever | Recovers without a restart | Hides an outage. If one message takes longer than Kafka's 5-minute poll limit, the consumer is removed from the group. |
+| C. Pause the partition and keep consuming the others | Healthy partitions keep moving | More complex, and a database outage affects every partition anyway |
+
+**Testing the Kafka consumer loop**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. Automated test with Testcontainers.Kafka | Repeatable, and runs in CI | A new package and a slow container, to test about 20 lines of loop code |
+| **B. Manual end-to-end check against the Docker Compose stack** ✅ | Exercises the real broker, database and failure paths, including a database outage | Not repeatable in CI |
+
+Chose B for now. The logic that matters (handler, retry, repository) is covered by automated tests. The crash test in Phase 6 exercises the loop again.
+
+**A leading byte order mark (BOM)**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. Strict: the message goes to the DLQ | The sender's bug is visible | Valid trades are rejected over an invisible encoding artifact |
+| **B. Ignore one leading BOM** ✅ | Allowed by RFC 8259, one line of code | The sender's bug goes unnoticed |
+| C. Reject any message that isn't clean ASCII | Strictest | Breaks legitimate UTF-8 content |
