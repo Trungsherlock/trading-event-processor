@@ -13,8 +13,8 @@ Design decisions, tradeoffs, metrics and workflow for the trade event processor.
 | 4. Repository + integration tests | Done (2026-11-17) |
 | 5. Handler + Kafka consumer | Done (2026-11-18) |
 | 6. Producer, crash test, throughput | Done (2026-11-19) |
-| 7. CI | Next |
-| 8. UML + README | Not started |
+| 7. CI | Workflow written and dry-run locally (2026-11-19). First GitHub run happens on the first push. |
+| 8. UML + README | Next |
 
 ## Design decisions
 
@@ -383,3 +383,57 @@ A review against "production level" found three gaps worth closing now. The cons
 |---|---|---|
 | **A. `apache/kafka:4.3.1`, the same as Docker Compose** ✅ | Tests the same broker version as local runs | None found. The Testcontainers module supports it. |
 | B. The module's default Confluent image | Default | A different broker version from local runs |
+
+### 2026-11-19: Phase 7 (CI)
+
+- **Workflow:** GitHub Actions runs on pushes to `main`, on pull requests, and on demand. A newer push cancels the run already in progress. It only has read access to the repository.
+- **Steps:** restore, then build in Release with warnings as errors, then unit tests, then integration tests. `ubuntu-latest` has Docker, so the integration tests start real Postgres and Kafka with Testcontainers.
+- **Results:** a test-count table is written to the run's summary page. TRX files and coverage are uploaded as artifacts and kept for 14 days.
+- **SDK pinning:** `global.json` pins the SDK to 10.0.x, rolling forward to the newest 10.0 feature band. GitHub's runners may also have the .NET 11 SDK installed, and without the pin `dotnet` would pick it.
+- **Supply chain:** actions are pinned to commit SHAs (`checkout` v7.0.1, `setup-dotnet` v6.1.0, `upload-artifact` v7.0.2, the latest on 2026-11-19). Dependabot updates them monthly, plus one grouped NuGet PR a month.
+- **Local dry run** of the same commands:
+  - The SDK resolved to 10.0.404 through `global.json`.
+  - The build has 0 warnings with warnings as errors.
+  - 74 + 13 tests pass, and the summary table renders.
+  - Both YAML files parse.
+- Gate not fully passed yet: the workflow can't run on GitHub until the repo is pushed.
+
+#### Options considered
+
+**How actions are referenced**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. Major tag (`@v7`) | Readable, and gets fixes automatically | A tag can be moved to different code (supply-chain risk) |
+| **B. Exact commit SHA with a version comment, updated by Dependabot** ✅ | The code that runs can't change behind our back | Needs Dependabot (or manual bumps) to stay current |
+
+**Which SDK CI uses**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. `dotnet-version: 10.0.x` only | One line | `dotnet` picks the newest SDK on the runner, which may be .NET 11, so warnings can differ from local builds |
+| **B. Also add `global.json` (10.0, roll forward within 10.0)** ✅ | CI and local builds use the same SDK family | One more file. A future move to .NET 11 means editing it. |
+| C. Pin an exact SDK such as 10.0.404 | Fully reproducible | Breaks when that exact version isn't installed. Misses patches. |
+
+**How test results are reported**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. Console output only | Nothing to add | The test count is buried in the logs |
+| B. A third-party test-report action | Rich annotations | Another third-party dependency with access to the repository |
+| **C. TRX files, a small script writing a table to the summary page, and artifacts** ✅ | The count is visible on the run page, with no extra dependency | No inline annotations on failed tests |
+
+**Warnings**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. Allowed | Never blocks | Warnings pile up unnoticed |
+| **B. Errors in CI only** ✅ | Keeps `main` at 0 warnings, while local experiments aren't blocked | A warning shows up in CI, not locally |
+| C. Errors everywhere (in the project files) | Strictest | Slows down local work |
+
+**Jobs**
+
+| Option | Upside | Downside |
+|---|---|---|
+| **A. One job, with unit and integration tests as separate steps** ✅ | Builds once, and the failing step shows which kind of test broke | Unit-test results wait for the build only, not for Docker. That's fine at ~1 minute. |
+| B. Separate unit and integration jobs | Run in parallel | Builds twice. Barely faster at this size. |
