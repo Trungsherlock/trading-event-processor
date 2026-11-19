@@ -13,8 +13,8 @@ Design decisions, tradeoffs, metrics and workflow for the trade event processor.
 | 4. Repository + integration tests | Done (2026-11-17) |
 | 5. Handler + Kafka consumer | Done (2026-11-18) |
 | 6. Producer, crash test, throughput | Done (2026-11-19) |
-| 7. CI | Workflow written and dry-run locally (2026-11-19). First GitHub run happens on the first push. |
-| 8. UML + README | Next |
+| 7. CI | Done (2026-11-19). First GitHub run passed. |
+| 8. UML + README | Done (2026-11-19) |
 
 ## Design decisions
 
@@ -55,8 +55,9 @@ Fill these in only with measured values.
 
 | Metric | Value | How it's measured | Date |
 |---|---|---|---|
-| Unit tests | 74 (local run; CI not set up yet) | `dotnet test` count | 2026-11-18 |
-| Integration tests | 13: 6 repository, 2 DI wiring, 5 end-to-end worker (local run; CI not set up yet) | `dotnet test` count | 2026-11-19 |
+| Unit tests | 74 (passing in GitHub Actions) | CI test count | 2026-11-19 |
+| Integration tests | 13: 6 repository, 2 DI wiring, 5 end-to-end worker (passing in GitHub Actions) | CI test count | 2026-11-19 |
+| CI run time | 1 min 4 s for the whole job (integration tests 36 s) | First GitHub Actions run on `ubuntu-latest` | 2026-11-19 |
 | Full test run time | ~54 s (unit tests ~0.3 s; integration tests ~45 s, mostly starting Kafka and Postgres containers) | Local `dotnet test` wall time | 2026-11-19 |
 | Throughput, commit per message | 186 msg/s | 100k valid trades loaded first, Release build, rate from first to last `received_at` in the database, single run | 2026-11-19 |
 | Throughput, background offset commit | **268 msg/s** (1.4×) | Same as above | 2026-11-19 |
@@ -396,7 +397,8 @@ A review against "production level" found three gaps worth closing now. The cons
   - The build has 0 warnings with warnings as errors.
   - 74 + 13 tests pass, and the summary table renders.
   - Both YAML files parse.
-- Gate not fully passed yet: the workflow can't run on GitHub until the repo is pushed.
+- **First run on GitHub** (push of `7d4bb9d`): passed in 1 min 4 s. SDK 10.0.404, 0 warnings, 74 unit and 13 integration tests passed. The integration tests took 36 s on `ubuntu-latest`, against 45 s locally. Dependabot's first scans for actions and NuGet started on the same push.
+- Gate passed: build and all tests run green in GitHub Actions on every push.
 
 #### Options considered
 
@@ -437,3 +439,41 @@ A review against "production level" found three gaps worth closing now. The cons
 |---|---|---|
 | **A. One job, with unit and integration tests as separate steps** ✅ | Builds once, and the failing step shows which kind of test broke | Unit-test results wait for the build only, not for Docker. That's fine at ~1 minute. |
 | B. Separate unit and integration jobs | Run in parallel | Builds twice. Barely faster at this size. |
+
+### 2026-11-19: Phase 8 (UML + README)
+
+- **README sections:** CI badge, results summary, three diagrams, delivery guarantees, failure-handling table, message format and the 8 rules, run commands, test strategy, crash test and throughput (with how each number was measured), design decisions in one line each with a link here, known limitations, project layout.
+- **Diagrams (Mermaid, rendered by GitHub):**
+  - an architecture flowchart
+  - a sequence diagram of one message, including the duplicate, DLQ and stop-after-retries paths
+  - a class diagram grouped by layer (`Worker`, `Core`, `Infrastructure`), showing that Core owns the interfaces and Infrastructure implements them
+- **Checked:**
+  - All three diagrams were rendered locally with the Mermaid CLI 11.4.2 with no errors, and the images were reviewed for readability.
+  - The README's run commands were run exactly as written from the repo root on a fresh stack. The worker started, 10,000 trades were sent, and `verify` passed all three checks.
+- **Small fix found along the way:** `TradeProducer` writes `expected.json` to the current folder, so it's now in `.gitignore`.
+- Gate passed: the README renders, its commands work, and every number in it comes from a measurement in this log.
+
+#### Options considered
+
+**Diagram format**
+
+| Option | Upside | Downside |
+|---|---|---|
+| **A. Mermaid in the README** ✅ | GitHub renders it, it's plain text so diffs are readable, and it lives next to the code | Less control over layout |
+| B. Images exported from a drawing tool | Full layout control | Go stale silently, and changes are binary diffs |
+| C. ASCII art | Works everywhere | Can't express a class diagram well, and is hard to edit |
+
+**How much goes in the README**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. Everything, including every option comparison | One place to read | Far too long for someone deciding in 2 minutes |
+| **B. Results, behaviour, how to run and test, and decisions in one line each, linking to WORKLOG.md for comparisons** ✅ | Readable fast, with the depth one click away | Two documents to keep in sync |
+| C. A minimal README with a docs folder | Clean front page | The key results and diagrams are hidden behind clicks |
+
+**Checking the README**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. Assume the diagrams and commands work | No effort | A Mermaid syntax error shows as an error box on GitHub, and a wrong command fails the first person who tries it |
+| **B. Render the diagrams locally with the Mermaid CLI and run the commands exactly as written on a fresh stack** ✅ | Both problems are caught before pushing | A one-off ~170 MB tool install in a scratch folder |
