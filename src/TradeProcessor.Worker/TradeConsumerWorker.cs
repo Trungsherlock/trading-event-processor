@@ -17,17 +17,20 @@ public sealed class TradeConsumerWorker(TradeMessageHandler handler, RetryPolicy
 
     private async Task RunAsync(CancellationToken ct)
     {
+        var background = options.CommitMode == CommitMode.Background;
         var config = new ConsumerConfig
         {
             BootstrapServers = options.BootstrapServers,
             GroupId = options.GroupId,
-            EnableAutoCommit = false,                 // we decide when a message is done
             AutoOffsetReset = AutoOffsetReset.Earliest,
+            EnableAutoCommit = background,            // PerMessage: we commit each offset ourselves
+            EnableAutoOffsetStore = false,            // only offsets we mark as done get committed
         };
 
         using var consumer = new ConsumerBuilder<Ignore, string?>(config).Build();
         consumer.Subscribe(options.Topic);
-        log.LogInformation("Consuming {Topic} as group {Group}", options.Topic, options.GroupId);
+        log.LogInformation("Consuming {Topic} as group {Group}, commit mode {Mode}",
+            options.Topic, options.GroupId, options.CommitMode);
 
         try
         {
@@ -42,7 +45,9 @@ public sealed class TradeConsumerWorker(TradeMessageHandler handler, RetryPolicy
                         cr.Partition.Value, cr.Offset.Value, attempt, wait.TotalMilliseconds),
                     ct);
 
-                consumer.Commit(cr);                  // only after the DB commit or the DLQ publish
+                // Only after the DB commit or the DLQ publish
+                if (background) consumer.StoreOffset(cr);   // committed in the background
+                else consumer.Commit(cr);                   // committed now, waiting for the broker
 
                 var level = outcome switch
                 {
@@ -61,8 +66,7 @@ public sealed class TradeConsumerWorker(TradeMessageHandler handler, RetryPolicy
         {
             log.LogCritical(ex, "Stopping: a message could not be handled after retries. " +
                 "Its offset was not committed, so it will be redelivered after restart.");
-            Environment.ExitCode = 1;
-            throw;                                    // stops the host
+            throw;                                    // stops the host; Program.cs turns it into exit code 1
         }
         finally
         {

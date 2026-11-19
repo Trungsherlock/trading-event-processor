@@ -12,8 +12,8 @@ Design decisions, tradeoffs, metrics and workflow for the trade event processor.
 | 3. Domain + validation (TDD) | Done (2026-11-17) |
 | 4. Repository + integration tests | Done (2026-11-17) |
 | 5. Handler + Kafka consumer | Done (2026-11-18) |
-| 6. Producer, crash test, throughput | Next |
-| 7. CI | Not started |
+| 6. Producer, crash test, throughput | Done (2026-11-19) |
+| 7. CI | Next |
 | 8. UML + README | Not started |
 
 ## Design decisions
@@ -28,6 +28,7 @@ Design decisions, tradeoffs, metrics and workflow for the trade event processor.
 | Integration tests share one Postgres container and empty the tables before each test | The container starts once per run instead of once per test. Every test still starts from an empty database. | Tests in the shared group run one at a time, not in parallel. |
 | The handler splits failures into permanent and temporary | Permanent failures (malformed, invalid, rejected by the database) go to the DLQ and the offset is committed. Temporary ones (database or Kafka unreachable) propagate, and the offset isn't committed. | Every new failure type has to be classified, and a wrong guess either loops forever or loses a retry. |
 | Retry the whole handler call in the worker: 3 retries with exponential backoff, then stop with exit code 1 | One retry point covers both database and DLQ outages. Stopping keeps the message uncommitted, so it's redelivered after a restart. | Something has to restart the worker. A retried DLQ publish can produce a duplicate DLQ entry. |
+| Background offset commits by default (`Kafka:CommitMode`) | Measured 1.4× faster than committing after every message. Still at-least-once, because only handled messages are marked. | A crash replays a few seconds of messages (308 in the crash test), which the idempotent write absorbs. Bad messages that are replayed get a second DLQ entry. |
 | Dead-letter queue (DLQ) for malformed or invalid messages | One bad message (a "poison pill") would otherwise block its partition forever. | Someone has to monitor the DLQ and replay or discard what lands there. |
 | Plain ADO.NET, no ORM | Full control over the SQL (`ON CONFLICT`, the transaction boundary). No ORM overhead. | More boilerplate. Mapping is done by hand. |
 | Core project has no Kafka or Postgres dependencies | Most tests run in milliseconds without Docker, which makes test-first practical. | Needs extra interfaces (`ITradeRepository`, `IDeadLetterPublisher`) and fakes. |
@@ -55,11 +56,17 @@ Fill these in only with measured values.
 | Metric | Value | How it's measured | Date |
 |---|---|---|---|
 | Unit tests | 74 (local run; CI not set up yet) | `dotnet test` count | 2026-11-18 |
-| Integration tests | 6 (local run; CI not set up yet) | `dotnet test` count | 2026-11-17 |
-| Throughput, commit per message | — msg/s | 100k messages, local machine | |
-| Throughput, background offset commit | — msg/s | 100k messages, local machine | |
-| Crash test: trade count matches producer | — | `kill` during a 50k run, then compare with the producer's totals | |
-| Crash test: positions match producer | — | Same as above | |
+| Integration tests | 13: 6 repository, 2 DI wiring, 5 end-to-end worker (local run; CI not set up yet) | `dotnet test` count | 2026-11-19 |
+| Full test run time | ~54 s (unit tests ~0.3 s; integration tests ~45 s, mostly starting Kafka and Postgres containers) | Local `dotnet test` wall time | 2026-11-19 |
+| Throughput, commit per message | 186 msg/s | 100k valid trades loaded first, Release build, rate from first to last `received_at` in the database, single run | 2026-11-19 |
+| Throughput, background offset commit | **268 msg/s** (1.4×) | Same as above | 2026-11-19 |
+| Throughput, background + `synchronous_commit=off` (diagnostic only, never for real use) | 602 msg/s | Same as above. Shows that Postgres waiting for the disk on each commit is the biggest cost. | 2026-11-19 |
+| Crash test: trade count matches producer | **PASS** (46,447 / 46,447) | Force-killed the worker during a 50k mixed run (5% invalid, 2% duplicates), restarted it, ran `TradeProducer verify` | 2026-11-19 |
+| Crash test: positions match producer | **PASS** (160 / 160) | Same as above | 2026-11-19 |
+| Crash test: messages replayed after the kill | 308 (291 caught as duplicates, 17 extra DLQ entries) | Messages logged as handled both before the kill and after the restart. Matches handled (16,265) minus committed (15,957). | 2026-11-19 |
+| Time from kill to processing resuming | 44 s | Restarted immediately, then polled the database every 200 ms. The broker waits out the 45 s session timeout first. | 2026-11-19 |
+
+Test machine: Intel Core Ultra 7 155H (22 logical cores), 15 GB RAM, Windows 11. Kafka and Postgres run in Docker Desktop 29.7.2 (WSL2), and the worker runs on the host.
 
 ## Workflow
 
@@ -249,7 +256,7 @@ Chose C for now. Switch to B if more helpers need sharing.
 | A. Automated test with Testcontainers.Kafka | Repeatable, and runs in CI | A new package and a slow container, to test about 20 lines of loop code |
 | **B. Manual end-to-end check against the Docker Compose stack** ✅ | Exercises the real broker, database and failure paths, including a database outage | Not repeatable in CI |
 
-Chose B for now. The logic that matters (handler, retry, repository) is covered by automated tests. The crash test in Phase 6 exercises the loop again.
+Chose B for now. The logic that matters (handler, retry, repository) is covered by automated tests. The crash test in Phase 6 exercises the loop again. **Superseded on 2026-11-19:** automated end-to-end tests were added after all (see "Closing the test gaps").
 
 **A leading byte order mark (BOM)**
 
@@ -258,3 +265,121 @@ Chose B for now. The logic that matters (handler, retry, repository) is covered 
 | A. Strict: the message goes to the DLQ | The sender's bug is visible | Valid trades are rejected over an invisible encoding artifact |
 | **B. Ignore one leading BOM** ✅ | Allowed by RFC 8259, one line of code | The sender's bug goes unnoticed |
 | C. Reject any message that isn't clean ASCII | Strictest | Breaks legitimate UTF-8 content |
+
+### 2026-11-19: Phase 6 (producer, crash test, throughput)
+
+- **Producer tool:** sends N trades keyed by account. About 5% are invalid (five kinds of bad message) and about 2% resend an earlier trade. Data comes from a seed, so `--seed` reproduces the same set. It writes the expected results to `expected.json`.
+- **`verify` command:** compares the trade count, all 160 positions and the number of new DLQ entries with `expected.json`. It prints PASS or FAIL and exits with 0 or 1. It was checked against a deliberately altered database and correctly reported FAIL.
+- **Throughput** (100k valid trades, details in Metrics):
+  - Commit after every message: 186 msg/s.
+  - Background commits: 268 msg/s, now the default.
+  - With Postgres not waiting for the disk (diagnostic only): 602 msg/s.
+  - Approximate cost per message:
+    - waiting for the Kafka commit: ~1.6 ms
+    - Postgres waiting for the disk on commit: ~2.1 ms
+    - everything else (3 database round trips through Docker Desktop, parsing, validation): ~1.7 ms
+  - **The bottleneck is one database transaction per message,** not Kafka.
+- **Crash test** (50k mixed messages, worker force-killed after about 15k):
+  - The trade count, all positions and the DLQ count all matched after the restart.
+  - 308 messages were replayed. 291 were caught as duplicates. 17 were bad messages that got a second DLQ entry, which is expected because the DLQ is at-least-once too.
+  - A second, shorter crash run also passed.
+- **Recovery delay:** after a kill, processing resumed 44 s later, even though the new worker started in 0.3 s. The broker waits for the dead consumer's 45 s session timeout before handing its partitions over.
+- Gate passed: the crash test matches the producer's totals, and both commit modes are measured.
+
+#### Options considered
+
+**Checking the results after a run**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. Print the expected totals and compare by eye (the plan) | No code | 160 positions to check by hand, which is error-prone |
+| B. Write the expected totals to a file and diff them with a PowerShell + `psql` script | No database code in the tool | Text parsing, and it only works on Windows |
+| **C. `verify` command in the producer tool** ✅ | Exact decimal comparison, a PASS/FAIL exit code, works on any OS | The tool needs the Npgsql package |
+
+**Switching between the two commit modes**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. Edit the code between runs | Nothing to configure | The mode not in the code can't be reproduced later |
+| **B. `Kafka:CommitMode` setting** ✅ | Both modes stay measurable, and the choice is visible in config | A few more lines in the worker |
+
+**How to measure throughput**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. Stopwatch from worker start until all rows exist | Simple | Includes startup and the ~2 s polling interval |
+| B. The worker logs its own rate | Live numbers | More code, and the logging itself slows the worker |
+| **C. Inside the database: rows ÷ (last `received_at` − first)** ✅ | Excludes startup, and doesn't depend on log timing | Only counts stored trades, so the benchmark uses clean data (no invalid messages or duplicates) |
+
+**Commit mode** (both measured)
+
+| Option | Rate | Upside | Downside |
+|---|---|---|---|
+| A. Commit after every message | 186 msg/s | A crash replays at most 1 message | Slower |
+| **B. Background commits** ✅ | 268 msg/s | 1.4× faster, still at-least-once | A crash replays a few seconds of messages, which the duplicate check absorbs |
+
+**The next throughput step** (not built; the bottleneck is one database transaction per message)
+
+| Option | Expected effect | Downside |
+|---|---|---|
+| A. Batch N messages into one transaction | One disk wait per batch, so probably several times faster | One bad trade fails the whole batch, so it needs per-row error handling. The DLQ logic gets more complex. |
+| B. `synchronous_commit=off` | 2.2× faster (measured) | **Breaks the design.** Postgres can lose a trade after its Kafka offset is already committed. Rejected. |
+| C. More partitions and more workers | Scales roughly linearly per worker | Needs more infrastructure, and each worker still does one transaction per message |
+
+**Recovery delay after a crash** (44 s measured)
+
+| Option | Upside | Downside |
+|---|---|---|
+| **A. Keep the 45 s default session timeout** ✅ | No change. Crashes are rare, and nothing is lost while waiting. | Up to 45 s of extra lag after a crash |
+| B. Lower the session timeout (e.g. 10 s) | Faster recovery | A pause or network blip can wrongly evict a healthy consumer and trigger needless rebalances |
+| C. Static group membership (`group.instance.id`) | A restarted worker reclaims its partitions immediately | Each instance needs its own stable ID. This is the fix to use once there are several long-running workers (e.g. Kubernetes pods). |
+
+### 2026-11-19: Closing the test gaps (before Phase 7)
+
+A review against "production level" found three gaps worth closing now. The consumer loop, which is where the delivery guarantee actually lives, was only checked by hand. The crash test was manual. Nothing checked the DI wiring. Gaps left open on purpose: an automated test of the DLQ publisher on its own, Kafka-outage and rebalance tests, and a soak test.
+
+- **DI wiring tests (2):**
+  - The worker's registrations moved into `AddTradeProcessor()`, which both `Program.cs` and the test call.
+  - The container is built with validation turned on, so a missing dependency fails.
+  - A reflection check fails if any rule class in Core isn't registered exactly once.
+- **End-to-end worker tests (5),** with the real worker against Testcontainers Kafka and Postgres:
+  - **A mixed stream** (invalid, duplicate and valid messages) ends with exactly the expected trades, positions and DLQ entries. Runs in both commit modes.
+  - **Replaying every message** through a fresh consumer group changes nothing in the database. That's the worst case after a crash, as if every offset were lost. The DLQ gets a second copy of each bad message, as expected.
+  - **A message that keeps failing is never committed,** and a healthy restart stores it. Runs in both commit modes.
+- **The tests catch the bugs they target.** Two bugs were added on purpose to check this, then reverted:
+  - Committing the offset before handling failed the "keeps failing" test in both modes.
+  - Removing one rule's registration failed the DI test.
+- **Exit code fix:** the worker used to set `Environment.ExitCode` itself, which would also change the test process's exit code. `Program.cs` now looks up the worker before the host runs and returns 1 if it failed. Checked by running the real worker against a database that refuses connections: exit code 1, nothing on stderr.
+- **Bug found and fixed while checking:** the first version checked the worker *after* `RunAsync()`. `RunAsync()` disposes the host, so the process crashed (exit code 0xE0434352) instead of returning 1.
+- Now 87 tests: 74 unit and 13 integration. All pass, and the build has 0 warnings.
+
+#### Options considered
+
+**How to test the DI wiring**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. Start the real `Program` in the test | Tests exactly what runs | Needs every external setting, and is awkward to start and stop |
+| **B. Move registrations into `AddTradeProcessor()`, build it with validation on, and use reflection to check every rule is registered** ✅ | Fast, needs no Docker, and also catches a *future* rule that's never registered | `Program.cs` itself isn't covered (it's 10 lines, checked by hand) |
+| C. Only resolve the handler | Simplest | Misses a forgotten rule, which resolves fine and silently stops checking |
+
+**How to run the worker in end-to-end tests**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. Launch the worker `.exe` as a separate process | A true kill is possible | Slower, depends on build output paths, and harder to inject a failing database |
+| **B. Run the real host in the test process with `AddTradeProcessor()`** ✅ | Same wiring as production, easy to inject a failing repository, and shorter retry waits | A kill can't happen inside the test process |
+
+**How to cover "crash" behaviour automatically**
+
+| Option | Upside | Downside |
+|---|---|---|
+| A. Kill a worker process mid-run, as in the manual test | The most realistic | Timing-dependent, so likely flaky in CI. Subject to the 45 s session-timeout wait. |
+| **B. Two tests: (1) replay the whole topic through a fresh consumer group, nothing may change; (2) a database that always fails, the offset must stay uncommitted** ✅ | Deterministic. Together they cover what a crash depends on: replays are absorbed, and only handled messages are committed. | Not a literal kill. The manual crash test from Phase 6 still covers that. |
+
+**Kafka image for tests**
+
+| Option | Upside | Downside |
+|---|---|---|
+| **A. `apache/kafka:4.3.1`, the same as Docker Compose** ✅ | Tests the same broker version as local runs | None found. The Testcontainers module supports it. |
+| B. The module's default Confluent image | Default | A different broker version from local runs |
